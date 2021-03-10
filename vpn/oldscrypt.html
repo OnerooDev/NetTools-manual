@@ -1,0 +1,590 @@
+#!/bin/bash
+#nano install && chmod +x install && ./install
+###
+# input node - input
+# between node - between
+# output node - output
+# single node - singel
+
+OPENSSL="openssl"
+
+LOCALE_GEN="/etc/locale.gen"
+FILES_DIR="/root/.asr"
+EASY_RSA_DIR="/usr/share/easy-rsa"
+OPENVPN_DIR="/etc/openvpn"
+
+FIREWALL_FILENAME="firewall"
+CLIENT_VPN_FILENAME="client.conf"
+SERVER_VPN_FILENAME="01_aa.conf"
+#$($OPENSSL rand -hex 1).conf"
+VPN_MODE=$1
+VPN_IP_POOL="10.$(( ((RANDOM<<15)|RANDOM) % 254 )).$(( ((RANDOM<<15)|RANDOM) % 254 ))"
+VPN_IP="${VPN_IP_POOL}.1"
+VPN_IP_POOL="${VPN_IP_POOL}.0"
+#IP Range 1-126
+#VPN_NETMASK="255.255.255.128"
+#VPN_IP_RANGE="${VPN_IP_POOL}/25"
+#IP Range 1-62
+#VPN_NETMASK="255.255.255.192"
+#VPN_IP_RANGE="${VPN_IP_POOL}/26"
+#IP Range 1-30
+#VPN_NETMASK="255.255.255.224"
+#VPN_IP_RANGE="${VPN_IP_POOL}/27"
+#IP Range 1-14
+VPN_NETMASK="255.255.255.240"
+VPN_IP_RANGE="${VPN_IP_POOL}/24"
+
+VPN_IFACE="tun0"
+VPN_PORT=$(( ((RANDOM<<15)|RANDOM) % 63001 + 2000 ))
+
+SSH_PORT=22
+
+GW_IP=$(ip route | awk '/default/{print substr($3,0)}')
+GW_IP_1=$(echo ${GW_IP} | cut -d "." -f 1)
+#INET_IP=$(ip -4 a | grep "$GW_IP_1" | awk '/inet /{print substr($2,0)}' | cut -d "/" -f 1)
+#myIP=$(ip a s|sed -ne '/127.0.0.1/!{s/^[ \t]*inet[ \t]*\([0-9.]\+\)\/.*$/\1/p}')
+#INET_IP=$(hostname -i)
+INET_IP=$(ip route get 1 | awk '{print $NF;exit}');
+INET_IFACE=$(ip -4 a | grep "$INET_IP" | awk '{print $7}' | cut -d ":" -f 1)
+
+INET_IP=$(ip addr | grep 'inet' | grep -v inet6 | grep -vE '127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -o -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+
+if [[ "$INET_IP" = "" ]]; then
+$INET_IP=$(wget -qO- ipv4.icanhazip.com)
+fi
+
+#if [ -z "$INET_IP" ]
+#then
+#echo "IP Not Found"
+# exit 1;
+#fi
+
+echo "IP Info - " $INET_IP ":" $INET_IFACE
+
+if [[ "$USER" != 'root' ]]; then
+echo "Sorry, you need to run this as root"
+exit
+fi
+
+
+if [[ ! -e /dev/net/tun ]]; then
+echo "TUN/TAP is not available"
+exit
+fi
+
+newclient() {
+
+CERT_CLIENT=$($OPENSSL rand -hex 3)
+NEW_FILENAME=$FILES_DIR/$1
+
+if [[ -n $2 ]]; then
+CERT_CLIENT=$2
+fi
+
+$FILES_DIR/easy-rsa/pkitool --keysize 4096 ${CERT_CLIENT}
+
+# Generates the custom client.ovpn
+cp $FILES_DIR/client-common.txt $NEW_FILENAME
+
+echo "<cert>" >> $NEW_FILENAME
+cat $FILES_DIR/easy-rsa/keys/${CERT_CLIENT}.crt >> $NEW_FILENAME
+echo "</cert>" >> $NEW_FILENAME
+echo "<key>" >> $NEW_FILENAME
+cat $FILES_DIR/easy-rsa/keys/${CERT_CLIENT}.key >> $NEW_FILENAME
+echo "</key>" >> $NEW_FILENAME
+
+}
+
+create_new_vpn() {
+if [ -f $LOCALE_GEN ]; then
+if [[ $(cat $LOCALE_GEN|awk '/en_US.UTF-8/{print $1}') = '#' ]]; then
+echo "Reload Locales en_US.UTF-8"
+
+if [ -w $LOCALE_GEN ]; then
+sed -i -e "s/# en_US.UTF-8 /en_US.UTF-8 /" $LOCALE_GEN
+locale-gen
+else
+echo "Locales dont access write"
+fi
+fi
+fi
+
+echo ""
+echo "IPv4 address:"
+read -p "IP address: " -e -i $INET_IP INET_IP
+echo ""
+echo "What port do you want for OpenVPN?"
+read -p "Port: " -e -i $VPN_PORT VPN_PORT
+
+echo ""
+echo "What DNS do you want to use with the VPN?"
+echo " 1) OpenDNS"
+echo " 2) Level 3"
+echo " 3) NTT"
+echo " 4) Hurricane Electric"
+echo " 5) Google"
+read -p "DNS [1-5]: " -e DNS
+
+echo ""
+echo "Vpn Mode"
+echo " 1) Single - single vpn"
+echo " 2) Between - "
+echo " 3) Output"
+echo " 4) Input"
+read -p "Vpn Mode[1-4]: " -e VPN_MODE
+echo ""
+echo "Okay, that was all I needed. We are ready to setup your OpenVPN server now"
+sleep 10
+#read -n1 -r -p "Press any key to continue..."
+
+
+case $VPN_MODE in
+1)
+VPN_MODE="singel"
+;;
+2)
+VPN_MODE="between"
+;;
+3)
+VPN_MODE="output"
+;;
+4)
+VPN_MODE="input"
+;;
+esac
+
+case $DNS in
+#OpenDNS
+1)
+DNS_1="208.67.222.222"
+DNS_2="208.67.220.220"
+;;
+#Level 3
+2)
+DNS_1="4.2.2.2"
+DNS_2="4.2.2.4"
+;;
+#NTT
+3)
+DNS_1="129.250.35.250"
+DNS_2="129.250.35.251"
+;;
+#Hurricane Electric
+4)
+DNS_1="74.82.42.42"
+;;
+#Google
+5)
+DNS_1="8.8.8.8"
+DNS_2="8.8.4.4"
+;;
+esac
+
+echo "nameserver $DNS_1" > /etc/resolv.conf;
+if [ ! -z "$DNS_2" ]; then
+echo "nameserver $DNS_2" >> /etc/resolv.conf;
+fi
+
+apt-get purge apache* -y > /dev/null
+apt-get purge samba* -y > /dev/null
+apt-get purge postfix* -y > /dev/null
+apt-get purge exim* -y > /dev/null
+apt-get purge sendmail* -y > /dev/null
+
+echo "APT Update & Upgrade"
+
+apt-get update > /dev/nuul
+apt-get -y -qq upgrade
+
+echo "INSTALL OPENVPN"
+apt-get -y -qq install easy-rsa openvpn
+
+echo "Create certificates: " $FILES_DIR
+mkdir -p $FILES_DIR
+cp -R ${EASY_RSA_DIR} $FILES_DIR
+
+cd $FILES_DIR/easy-rsa/
+
+source vars
+
+CERT_CA="ca"
+CERT_SERVER=$($OPENSSL rand -hex 3)
+
+CERT_TA=$($OPENSSL rand -hex 3)
+CERT_DH=$($OPENSSL rand -hex 3)
+
+./clean-all
+./pkitool --initca
+./pkitool --keysize 4096 --server ${CERT_SERVER}
+$OPENSSL dhparam -out ${KEY_DIR}/${CERT_DH} ${KEY_SIZE}
+openvpn --genkey --secret ${KEY_DIR}/${CERT_TA}
+
+cp keys/${CERT_CA}.crt keys/${CERT_SERVER}.{crt,key} keys/${CERT_TA} keys/${CERT_DH} ${OPENVPN_DIR}/
+
+cd ..
+
+echo "Client config - " $VPN_PORT
+##########################################
+####### BEGIN CLIENT CONFIG ##############
+##########################################
+echo "
+client
+dev tun
+proto tcp
+remote $INET_IP $VPN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+ns-cert-type server
+mssfix 0
+comp-lzo
+auth SHA256
+cipher AES-256-CBC
+verb 3
+key-direction 1
+"> client-common.txt
+
+echo "<ca>" >> $FILES_DIR/client-common.txt
+cat easy-rsa/keys/${CERT_CA}.crt >> $FILES_DIR/client-common.txt
+echo "</ca>" >> $FILES_DIR/client-common.txt
+
+echo "<tls-auth>" >> $FILES_DIR/client-common.txt
+cat easy-rsa/keys/$CERT_TA >> $FILES_DIR/client-common.txt
+echo "</tls-auth>" >> $FILES_DIR/client-common.txt
+echo "" >> $FILES_DIR/client-common.txt
+
+newclient $CLIENT_VPN_FILENAME
+
+if [ "output" = "$VPN_MODE" ] || [ "between" = "$VPN_MODE" ]; then
+echo "
+
+verb 0
+script-security 2
+up ${OPENVPN_DIR}/${FIREWALL_FILENAME}
+" >> $CLIENT_VPN_FILENAME
+fi
+
+echo "Create Server config"
+##########################################
+############ SERVER CONFIG ###############
+##########################################
+echo "
+port ${VPN_PORT}
+proto tcp
+dev tun
+ca ${CERT_CA}.crt
+cert ${CERT_SERVER}.crt
+key ${CERT_SERVER}.key
+dh ${CERT_DH}
+tls-auth ${CERT_TA} 0
+server ${VPN_IP_POOL} ${VPN_NETMASK}
+ifconfig-pool-persist ipp.txt
+keepalive 10 120
+mssfix 0
+cipher AES-256-CBC
+auth SHA256
+comp-lzo
+persist-key
+persist-tun
+verb 3
+" > ${OPENVPN_DIR}/${SERVER_VPN_FILENAME}
+
+if [ "input" = "$VPN_MODE" ] || [ "singel" = "$VPN_MODE" ]; then
+echo 'push "redirect-gateway def1 bypass-dhcp"' >> ${OPENVPN_DIR}/${SERVER_VPN_FILENAME};
+echo 'push "dhcp-option DNS '$DNS_1'"' >> ${OPENVPN_DIR}/${SERVER_VPN_FILENAME};
+if [ ! -z "$DNS_2" ]; then
+echo 'push "dhcp-option DNS '$DNS_2'"' >> ${OPENVPN_DIR}/${SERVER_VPN_FILENAME};
+fi
+fi
+
+echo "Create Firewall"
+##########################################
+############# FIREWALL ###################
+##########################################
+
+if [ "input" = "$VPN_MODE" ] || [ "between" = "$VPN_MODE" ]; then
+PPP_IP="\$5"
+PPP_IFACE="\$1"
+else
+PPP_IP=${INET_IP}
+PPP_IFACE=${INET_IFACE}
+fi
+
+cat > ${OPENVPN_DIR}/${FIREWALL_FILENAME} << EOF
+#!/bin/sh
+
+INET_IP="${INET_IP}"
+INET_IFACE="${INET_IFACE}"
+
+PPP_IP="${PPP_IP}"
+PPP_IFACE="${PPP_IFACE}"
+PPP_IP_RANGE=
+
+VPN_MODE="${VPN_MODE}"
+
+LAN_IP="${VPN_IP}"
+LAN_IP_RANGE="${VPN_IP_RANGE}"
+LAN_IFACE="${VPN_IFACE}"
+
+LO_IFACE="lo"
+LO_IP="127.0.0.1"
+
+IPT="/sbin/iptables"
+IP="/sbin/ip"
+
+service rsyslog stop
+
+if [ "input" = "\$VPN_MODE" ] || [ "between" = "\$VPN_MODE" ]; then
+\$IP rule del table 120
+\$IP route add default via \$PPP_IP table 120
+\$IP rule add from \$LAN_IP_RANGE table 120
+fi
+echo "1" > /proc/sys/net/ipv4/ip_forward
+
+\$IPT -F
+\$IPT -X
+\$IPT -F -t nat
+
+\$IPT -P INPUT DROP
+\$IPT -P OUTPUT DROP
+\$IPT -P FORWARD DROP
+
+\$IPT -N bad_tcp_packets
+\$IPT -N allowed
+\$IPT -N tcp_packets
+\$IPT -N udp_packets
+\$IPT -N icmp_packets
+
+\$IPT -A bad_tcp_packets -p tcp --tcp-flags SYN,ACK SYN,ACK -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset
+\$IPT -A bad_tcp_packets -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
+
+\$IPT -A allowed -p TCP --syn -j ACCEPT
+\$IPT -A allowed -p TCP -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+\$IPT -A allowed -p TCP -j DROP
+
+\$IPT -A tcp_packets -p TCP -s 0/0 --dport ${SSH_PORT} -j allowed
+
+\$IPT -A udp_packets -p UDP -s 0/0 --destination-port ${VPN_PORT} -j ACCEPT
+
+\$IPT -A INPUT -p tcp -j bad_tcp_packets
+
+\$IPT -A INPUT -p ALL -i \$LAN_IFACE -s \$LAN_IP_RANGE -j ACCEPT
+[ ! -n "\$PPP_IP_RANGE" ] || \$IPT -A INPUT -p ALL -i \$PPP_IFACE -s \$PPP_IP_RANGE -j ACCEPT
+\$IPT -A INPUT -p ALL -i \$LO_IFACE -s \$LO_IP -j ACCEPT
+\$IPT -A INPUT -p ALL -i \$LO_IFACE -s \$LAN_IP -j ACCEPT
+\$IPT -A INPUT -p ALL -i \$LO_IFACE -s \$INET_IP -j ACCEPT
+\$IPT -A INPUT -p ALL -i \$LO_IFACE -s \$PPP_IP -j ACCEPT
+
+\$IPT -A INPUT -p ALL -d \$INET_IP -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+\$IPT -A INPUT -p TCP -i \$INET_IFACE -j tcp_packets
+\$IPT -A INPUT -p UDP -i \$INET_IFACE -j udp_packets
+\$IPT -A INPUT -p ICMP -i \$INET_IFACE -j icmp_packets
+
+\$IPT -A INPUT -p ALL -d \$PPP_IP -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+\$IPT -A FORWARD -p tcp -j bad_tcp_packets
+\$IPT -A FORWARD -i \$LAN_IFACE -j ACCEPT
+\$IPT -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+\$IPT -A OUTPUT -p tcp -j bad_tcp_packets
+\$IPT -A OUTPUT -p ALL -s \$LO_IP -j ACCEPT
+\$IPT -A OUTPUT -p ALL -s \$LAN_IP -j ACCEPT
+\$IPT -A OUTPUT -p ALL -s \$INET_IP -j ACCEPT
+\$IPT -A OUTPUT -p ALL -s \$PPP_IP -j ACCEPT
+[ ! -n "\$PPP_IP_RANGE" ] || \$IPT -A OUTPUT -p ALL -s \$PPP_IP_RANGE -j ACCEPT
+
+\$IPT -t nat -A POSTROUTING -o \$PPP_IFACE -j MASQUERADE
+EOF
+
+chmod +x ${OPENVPN_DIR}/${FIREWALL_FILENAME}
+
+if [ "output" = "$VPN_MODE" ] || [ "singel" = "$VPN_MODE" ]; then
+ln -s ${OPENVPN_DIR}/${FIREWALL_FILENAME} /etc/network/if-up.d/zfw
+fi
+
+echo "SYSLOG stop and disable"
+service rsyslog stop
+echo > /etc/rsyslog.conf
+update-rc.d rsyslog disable
+update-rc.d rsyslog remove
+
+echo "/var/log remove and link to /dev/null"
+rm -R /var/log
+ln -s /dev/null /var/log
+
+#shutdown -r
+
+echo "Complited";
+echo "${OPENVPN_DIR}/${FIREWALL_FILENAME} -firewall";
+echo "${OPENVPN_DIR}/${SERVER_VPN_FILENAME} - vpn server config";
+echo "${FILES_DIR}/${CLIENT_VPN_FILENAME} - vpn client config";
+echo "${FILES_DIR}/easy-rsa/ - EASY RSA dir";
+exit
+}
+
+
+while :
+do
+clear
+echo "Looks like OpenVPN is already installed"
+echo ""
+echo "What do you want to do?"
+echo " 1) Install VPN Server"
+echo " 2) Add a cert for a new user"
+echo " 3) Exit"
+read -p "Select an option [1-3]: " option
+case $option in
+1)
+create_new_vpn
+;;
+2)
+if [[ ! -e ${OPENVPN_DIR}/${SERVER_VPN_FILENAME} ]]; then
+echo ""
+echo "VPN Server dont install"
+exit
+fi
+CLIENT=$($OPENSSL rand -hex 3)
+echo ""
+echo "Tell me a name for the client cert"
+echo "Please, use one word only, no special characters"
+read -p "Client name: " -e -i $CLIENT CLIENT
+cd $FILES_DIR/easy-rsa/
+source vars
+# Generates the custom client.ovpn
+newclient "$CLIENT.ovpn" $CLIENT
+echo ""
+echo "Client $CLIENT added, certs available at ${FILES_DIR}/$CLIENT.ovpn"
+exit
+;;
+3) exit;;
+esac
+done
+
+
+
+это тебе на сервере надо делать
+права дай
+и запусти
+./name_scrypt
+появится в главном каталоге папке .asr
+там файл client.conf
+
+
+_________________________________________________________________________
+UFW method
+_________________________________________________________________________
+1. 
+$ sudo nano /etc/sysctl.conf
+#net.ipv4.ip_forward=1
+____________________________
+If you do double - set it
+#net.ipv4.conf.tun0.rp_filter=0
+net.ipv4.conf.tun1.rp_filter=0
+____________________________
+?$echo 1 > /proc/sys/net/ipv4/ip_forward
+
+$ sudo sysctl -p
+  
+2. 
+$ ip route | grep default  (See interface)
+$ sudo nano /etc/ufw/before.rules
+##
+# -A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT  (comment)
+##
+# START OPENVPN RULES
+# NAT table rules
+*nat
+:POSTROUTING ACCEPT [0:0]
+# Allow traffic from OpenVPN client to ens3 (change to the interface you discovered!)
+-A POSTROUTING -s 10.43.158.0/24 -o eth0 -j MASQUERADE
+COMMIT
+# END OPENVPN RULES
+##
+##
+
+$ sudo nano /etc/default/ufw
+##DEFAULT_FORWARD_POLICY="ACCEPT"
+
+3. 
+$ sudo ufw allow 443/udp
+$ sudo ufw allow OpenSSH
+$ sudo ufw disable
+$ sudo ufw enable
+
+$ sudo systemctl start openvpn@server
+
+___________________________________________________________________
+IPTABLES
+___________________________________________________________________
+sudo nano /etc/sysctl.conf
+#net.ipv4.ip_forward=1
+____________________________
+If you do double - set it
+#net.ipv4.conf.tun0.rp_filter=0
+net.ipv4.conf.tun1.rp_filter=0
+____________________________
+
+$ sudo sysctl -p
+
+#Rules for single vpn server
+iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
+iptables -A FORWARD -j REJECT
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
+#Anti tun ping
+iptables -A OUTPUT -p icmp --icmp-type echo-request -j DROP
+iptables -A INPUT -p icmp --icmp-type echo-reply -j DROP
+iptables -A INPUT -p icmp --icmp-type echo-request -j REJECT
+#
+iptables-save > /root/iptables-rules
+nano /etc/rc.local
+вот эту строчку
+iptables-restore < /root/iptables-rules
+##
+
+######################################################################
+Уже должно работать. Далее по парано^W безопасности:
+разрешаем только установленные и связанные с ними соединения:
+iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+И запрещаем всё, что не разрешено явно (в данном случае разрешены только входящие openvpn соединения):
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+#####################################################################
+___________________________________________
+Do double
+ip rule del table npv_net
+ip rule add from 10.64.91.0/24 table npv_net
+ip route add default dev tun1 table npv_net
+iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -s 10.246.81.0/24 -j ACCEPT
+iptables -A FORWARD -j REJECT
+iptables -t nat -A POSTROUTING -s 10.246.81.0/24 -o tun1 -j MASQUERADE
+iptables -A FORWARD -i tun0 -o tun1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i tun1 -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+____________________
+iptables-save > /root/iptables-rules
+nano /etc/rc.local
+вот эту строчку
+iptables-restore < /root/iptables-rules
+__________________________________
+nano /etc/iproute2/rt_tables
+150     vpn_net
+
+__________________________________________
+(RC>LOCAL)
+service openvpn start
+openvpn --config /root/client.conf
+ip rule del table npv_net
+ip rule add from 10.43.158.0/24 table npv_net
+ip route add default dev tun1 table npv_net
+iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -s 10.43.158.0/24 -j ACCEPT
+iptables -A FORWARD -j REJECT
+iptables -t nat -A POSTROUTING -s 10.43.158.0/24 -o tun1 -j MASQUERADE
+iptables -A FORWARD -i tun0 -o tun1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i tun1 -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+systemctl restart openvpn@01_aa
+------------------------------------------
